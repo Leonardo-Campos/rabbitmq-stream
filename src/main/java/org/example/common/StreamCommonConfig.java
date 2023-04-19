@@ -3,28 +3,25 @@ package org.example.common;
 import com.rabbitmq.stream.Environment;
 import com.rabbitmq.stream.OffsetSpecification;
 import com.rabbitmq.stream.impl.StreamEnvironmentBuilder;
-import lombok.RequiredArgsConstructor;
-import org.springframework.amqp.core.*;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.core.RabbitAdmin;
-import org.springframework.amqp.rabbit.listener.RabbitListenerContainerFactory;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.amqp.RabbitProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.rabbit.stream.config.StreamRabbitListenerContainerFactory;
 import org.springframework.rabbit.stream.listener.StreamListenerContainer;
 import org.springframework.rabbit.stream.producer.RabbitStreamTemplate;
 import org.springframework.rabbit.stream.retry.StreamRetryOperationsInterceptorFactoryBean;
 import org.springframework.retry.support.RetryTemplate;
-import org.springframework.util.unit.DataSize;
 
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
+import static java.util.concurrent.CompletableFuture.delayedExecutor;
+
 @Configuration
-@RequiredArgsConstructor
-class EventStreamConfig {
+class StreamCommonConfig {
     @Value("${spring.application.name}")
     private String applicationName;
 
@@ -45,30 +42,8 @@ class EventStreamConfig {
     }
 
     @Bean
-    RabbitStreamTemplate rabbitStreamTemplate(Environment env,
-                                              Exchange superStream,
-                                              Jackson2JsonMessageConverter jackson2JsonMessageConverter) {
-        var template = new RabbitStreamTemplate(env, superStream.getName());
-        template.setMessageConverter(jackson2JsonMessageConverter);
-        template.setProducerCustomizer(
-                (s, builder) -> builder
-                        .routing(Object::toString)
-                        .producerBuilder()
-        );
-        return template;
-    }
-
-    @Bean
-    RabbitListenerContainerFactory<StreamListenerContainer> streamContainerFactory(Environment env) {
-        var factory = new StreamRabbitListenerContainerFactory(env);
-        factory.setNativeListener(true);
-        factory.setConsumerCustomizer(
-                (id, builder) ->
-                        builder.name(applicationName)
-                                .offset(OffsetSpecification.first())
-                                .manualTrackingStrategy()
-        );
-        return factory;
+    <T> StreamListenerMessageConverter<T> streamListenerMessageConverter(ObjectMapperSupplier<T> objectMapperSupplier) {
+        return streamListener -> new SimpleStreamMessageListener<>(streamListener, objectMapperSupplier);
     }
 
     @Bean
@@ -90,29 +65,30 @@ class EventStreamConfig {
     }
 
     @Bean
-    Exchange superStream() {
-        return ExchangeBuilder
-                .directExchange(applicationName)
-                .build();
+    RabbitStreamTemplateSimpleFactory rabbitStreamTemplateSimpleFactory(Environment env,
+                                                                        Jackson2JsonMessageConverter jackson2JsonMessageConverter) {
+        return stream -> {
+            var template = new RabbitStreamTemplate(env, stream);
+            template.setMessageConverter(jackson2JsonMessageConverter);
+            template.setSuperStreamRouting(message -> UUID.randomUUID().toString());
+            return template;
+        };
     }
 
     @Bean
-    Queue streamPartition() {
-        return QueueBuilder
-                .durable("partition-1")
-                .stream()
-                .withArgument("x-max-age", "7D")
-                .withArgument("x-max-length-bytes", DataSize
-                        .ofGigabytes(10).toBytes())
-                .build();
-    }
-
-    @Bean
-    Binding streamPartitionBind(Exchange superStream, Queue streamPartition) {
-        return BindingBuilder
-                .bind(streamPartition)
-                .to(superStream)
-                .with("")
-                .noargs();
+    <T> StreamListenerContainerSimpleFactory<T> streamListenerContainerSimpleFactory(Environment env,
+                                                                                     StreamListenerMessageConverter<T> streamListenerMessageConverter) {
+        return (stream, streamListener) -> {
+            var container = new StreamListenerContainer(env);
+            container.setAutoStartup(false);
+            container.superStream(stream, applicationName);
+            container.setupMessageListener(streamListenerMessageConverter.apply(streamListener));
+            container.setConsumerCustomizer(
+                    (id, builder) -> builder.offset(OffsetSpecification.first())
+                            .manualTrackingStrategy()
+            );
+            delayedExecutor(5, TimeUnit.SECONDS).execute(container::start);
+            return container;
+        };
     }
 }
